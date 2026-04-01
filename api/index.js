@@ -8,9 +8,6 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Memori sementara untuk menyimpan pilihan user sebelum mereka mengetik username
-const userState = {};
-
 function buatUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
         const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
@@ -27,13 +24,15 @@ function menuUtama() {
     ]);
 }
 
-bot.start((ctx) => {
-    delete userState[ctx.chat.id]; // Reset memori jika user ketik /start
+bot.start(async (ctx) => {
+    // Hapus draft kalau user reset bot
+    await supabase.from('transaksi').delete().eq('order_id', `DRAFT-${ctx.chat.id}`);
+    
     ctx.reply('⚡ Selamat datang di MasD VPNStore Premium.\n\n👇 Silakan pilih menu di bawah ini:', menuUtama());
 });
 
-bot.action('KEMBALI_AWAL', (ctx) => {
-    delete userState[ctx.chat.id];
+bot.action('KEMBALI_AWAL', async (ctx) => {
+    await supabase.from('transaksi').delete().eq('order_id', `DRAFT-${ctx.chat.id}`);
     ctx.editMessageText('⚡ Selamat datang di MasD VPNStore Premium.\n\n👇 Silakan pilih menu di bawah ini:', menuUtama());
 });
 
@@ -74,7 +73,7 @@ bot.action(/SRV_([A-Z]+)_([A-Z]+)/, (ctx) => {
 });
 
 // ==========================================
-// 3. TAHAP MINTA USERNAME
+// 3. TAHAP MINTA USERNAME (SIMPAN DRAFT KE SUPABASE)
 // ==========================================
 bot.action(/PKG_([A-Z]+)_([A-Z]+)_(\d+)_(\d+)/, async (ctx) => {
     const proto = ctx.match[1];
@@ -83,11 +82,26 @@ bot.action(/PKG_([A-Z]+)_([A-Z]+)_(\d+)_(\d+)/, async (ctx) => {
     const harga = ctx.match[4];
     const chatId = ctx.chat.id;
 
-    // Simpan pilihan ke memori bot
-    userState[chatId] = { step: 'WAITING_USERNAME', proto, srv, durasi, harga };
+    await ctx.deleteMessage(); // Bersihkan tombol
 
-    await ctx.deleteMessage(); // Hapus tombol biar rapi
-    await ctx.reply(`Anda memilih <b>${proto} ${srv} (${durasi} Hari)</b>.\n\n✍️ <b>Silakan ketik Username VPN yang Anda inginkan:</b>\n<i>(Ketik langsung balas di chat ini, tanpa spasi atau simbol)</i>`, { parse_mode: 'HTML' });
+    try {
+        // Hapus draft lama jika ada biar bersih
+        await supabase.from('transaksi').delete().eq('order_id', `DRAFT-${chatId}`);
+
+        // Titipkan ingatan bot ke Supabase (Harga dititip di kolom username_vpn sementara)
+        await supabase.from('transaksi').insert([{
+            order_id: `DRAFT-${chatId}`,
+            chat_id: chatId,
+            layanan: `${proto}-${srv}`,
+            durasi: parseInt(durasi),
+            username_vpn: harga, 
+            status: 'draft'
+        }]);
+
+        await ctx.reply(`Anda memilih <b>${proto} ${srv} (${durasi} Hari)</b>.\n\n✍️ <b>Silakan ketik Username VPN yang Anda inginkan:</b>\n<i>(Ketik langsung balas di chat ini, tanpa spasi atau simbol)</i>`, { parse_mode: 'HTML' });
+    } catch (err) {
+        ctx.reply("⚠️ Gagal memproses data. Coba lagi nanti.");
+    }
 });
 
 // ==========================================
@@ -97,38 +111,44 @@ bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
     const text = ctx.message.text.trim();
 
-    // Cek apakah bot sedang menunggu username dari user ini
-    if (userState[chatId] && userState[chatId].step === 'WAITING_USERNAME') {
-        
-        // Validasi simpel: Username gak boleh ada spasi
-        if (text.includes(' ') || !/^[a-zA-Z0-9]+$/.test(text)) {
-            return ctx.reply('⚠️ Username hanya boleh berisi huruf dan angka tanpa spasi. Silakan ketik ulang:');
-        }
+    try {
+        // Cek ingatan bot (Draft) di Supabase
+        const { data: draft } = await supabase.from('transaksi').select('*').eq('order_id', `DRAFT-${chatId}`).single();
 
-        const { proto, srv, durasi, harga } = userState[chatId];
-        const usernameVpn = text.toLowerCase();
-        
-        delete userState[chatId]; // Hapus memori agar tidak double input
+        // Jika bot sedang menunggu username
+        if (draft && draft.status === 'draft') {
+            
+            // Validasi spasi/simbol
+            if (text.includes(' ') || !/^[a-zA-Z0-9]+$/.test(text)) {
+                return ctx.reply('⚠️ Username hanya boleh berisi huruf dan angka tanpa spasi. Silakan ketik ulang:');
+            }
 
-        const orderId = `${proto}-${srv}-${durasi}-${usernameVpn}-${chatId}-${Date.now()}`;
-        const namaLayanan = `${proto}-${srv}`;
+            const protoSrv = draft.layanan.split('-');
+            const proto = protoSrv[0];
+            const srv = protoSrv[1];
+            const durasi = draft.durasi;
+            const harga = parseInt(draft.username_vpn); // Ambil harga yang dititipkan
+            const usernameVpn = text.toLowerCase();
+            
+            const orderId = `${proto}-${srv}-${durasi}-${usernameVpn}-${chatId}-${Date.now()}`;
+            
+            const msgLoading = await ctx.reply(`<i>⏳ Sedang memproses invoice untuk username <b>${usernameVpn}</b>...</i>`, { parse_mode: 'HTML' });
 
-        const msgLoading = await ctx.reply(`<i>⏳ Sedang memproses invoice untuk username <b>${usernameVpn}</b>...</i>`, { parse_mode: 'HTML' });
+            // Hapus draft, dan masukkan order asli dengan status pending
+            await supabase.from('transaksi').delete().eq('order_id', `DRAFT-${chatId}`);
+            await supabase.from('transaksi').insert([{
+                order_id: orderId, chat_id: chatId, layanan: draft.layanan, durasi: durasi, username_vpn: usernameVpn, status: 'pending'
+            }]);
 
-        try {
-            await supabase.from('transaksi').insert([
-                { order_id: orderId, chat_id: chatId, layanan: namaLayanan, durasi: parseInt(durasi), username_vpn: usernameVpn, status: 'pending' }
-            ]);
-
+            // Tembak API Web untuk ambil QRIS
             const reqQris = await fetch('https://buy.masdpremium.biz.id/api/buat_qris', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ order_id: orderId, amount: parseInt(harga) })
+                body: JSON.stringify({ order_id: orderId, amount: harga })
             });
             const resQris = await reqQris.json();
 
             if (resQris.status === 'sukses' && resQris.qris_string) {
-                // Bikin QRIS ukuran ideal yang rapi (350x350)
                 const linkGambarQr = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(resQris.qris_string)}&margin=10`;
                 
                 const invoiceText = `🧾 <b>INVOICE PEMBAYARAN</b> 🧾\n\n` +
@@ -137,7 +157,7 @@ bot.on('text', async (ctx) => {
                                     `<b>Server:</b> ${srv}\n` +
                                     `<b>Durasi:</b> ${durasi} Hari\n` +
                                     `<b>Username:</b> <code>${usernameVpn}</code>\n` +
-                                    `<b>Tagihan:</b> <b>Rp ${parseInt(resQris.total_bayar).toLocaleString('id-ID')}</b>\n\n` +
+                                    `<b>Tagihan:</b> <b>Rp ${harga.toLocaleString('id-ID')}</b>\n\n` +
                                     `<i>⚠️ Silakan scan QR Code di atas. Sistem otomatis mengirim akun VPN Anda ke chat ini setelah pembayaran lunas.</i>`;
 
                 await ctx.deleteMessage(msgLoading.message_id); 
@@ -152,10 +172,9 @@ bot.on('text', async (ctx) => {
                 await ctx.deleteMessage(msgLoading.message_id); 
                 ctx.reply(`⚠️ Gagal memuat QRIS: ${resQris.alasan}`, Markup.inlineKeyboard([[Markup.button.callback('🔙 Menu Utama', 'KEMBALI_AWAL')]]));
             }
-        } catch(err) {
-            await ctx.deleteMessage(msgLoading.message_id); 
-            ctx.reply(`⚠️ Terjadi Error API: ${err.message}`, Markup.inlineKeyboard([[Markup.button.callback('🔙 Menu Utama', 'KEMBALI_AWAL')]]));
         }
+    } catch(err) {
+        console.log(err);
     }
 });
 
@@ -290,3 +309,4 @@ app.get('/api/setup', async (req, res) => {
 });
 
 module.exports = app;
+    
