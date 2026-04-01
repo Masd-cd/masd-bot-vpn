@@ -87,67 +87,51 @@ app.post('/api/pakasir', async (req, res) => {
             const protokol = potongLayanan[0];
             const serverDipilih = potongLayanan[1];
 
-            try {
-                bot.telegram.sendMessage(chatId, "✅ Pembayaran LUNAS! Sedang membuat akun di VPS...");
+                try {
+        await supabase.from('transaksi').insert([
+            { order_id: orderId, chat_id: chatId, layanan: namaLayanan, durasi: durasi, username_vpn: usernameVpn, status: 'pending' }
+        ]);
 
-                let vpsUrl = '';
-                let fetchOptions = {};
-                let passwordSsh = "1"; 
+        // 1. Minta QRIS ke Pakasir (Pastikan URL API ini sesuai dengan yang kamu pakai di web lama)
+        const reqQris = await fetch('https://app.pakasir.com/api/v1/payment', { 
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                api_key: process.env.PAKASIR_API, 
+                project: process.env.PAKASIR_SLUG || "masd", // <-- INI YANG KEMARIN KELUPAAN
+                order_id: orderId, 
+                amount: harga,
+                payment_method: "qris" 
+            })
+        });
+        
+        const resQris = await reqQris.json();
 
-                if (serverDipilih === 'SGDO') {
-                    let endpoint = protokol.toLowerCase() + 'all'; 
-                    if (protokol === 'SSH') endpoint = 'sshvpn';
+        // Jika Pakasir menolak, bot akan mengirimkan pesan error aslinya agar gampang kita lacak
+        if (!reqQris.ok) {
+            return ctx.reply(`⚠️ Ditolak Pakasir: ${JSON.stringify(resQris)}`);
+        }
 
-                    vpsUrl = `http://167.172.73.230/vps/${endpoint}`;
-                    let bodyData = { expired: durasi, limitip: 2, username: username };
-                    if (protokol !== 'SSH') { bodyData.kuota = 300; bodyData.uuidv2 = buatUUID(); }
-                    else bodyData.password = passwordSsh;
+        // 2. Ambil Teks QRIS dari balasan Pakasir (Sesuaikan path JSON-nya jika berbeda)
+        // Berdasarkan standar Pakasir, biasanya ada di resQris.payment.payment_number
+        const teksQris = resQris.payment?.payment_number || resQris.qris_string || resQris.data?.qr_string;
 
-                    fetchOptions = {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.POTATO_API_KEY}` },
-                        body: JSON.stringify(bodyData)
-                    };
-                } else if (serverDipilih === 'IDTECH') {
-                    let endpoint = 'add' + protokol.toLowerCase();
-                    vpsUrl = `https://www.agung-store.my.id/api/${endpoint}`;
-                    
-                    let bodyData = { server: "MASDVPN", username: username, ipLimit: 2, days: durasi };
-                    if (protokol !== 'SSH') bodyData.quota = 300;
-                    else bodyData.password = passwordSsh;
+        if (!teksQris) {
+             return ctx.reply(`⚠️ Gagal membaca teks QRIS: ${JSON.stringify(resQris)}`);
+        }
 
-                    fetchOptions = {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.AGUNG_API_KEY },
-                        body: JSON.stringify(bodyData)
-                    };
-                }
+        // 3. Sulap Teks QRIS jadi Link Gambar pakai API gratis
+        const linkGambarQr = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(teksQris)}`;
 
-                if (vpsUrl) {
-                    const resVPS = await fetch(vpsUrl, fetchOptions);
-                    const hasilVPS = await resVPS.json();
-                    
-                    if (resVPS.ok) {
-                        const akun = hasilVPS.data || hasilVPS.akun || hasilVPS;
-                        await supabase.from('transaksi').update({ status: 'sukses' }).eq('order_id', orderId);
-
-                        let pesanSukses = `🎉 **AKUN ${protokol} BERHASIL DIBUAT** 🎉\n\n` +
-                                          `Username: ${akun.username || akun.user || username}\n`;
-                        if (protokol === 'SSH') pesanSukses += `Password: ${akun.password || akun.pass || passwordSsh}\n`;
-                        pesanSukses += `Host: ${akun.hostname || akun.domain || akun.host || "id.masdvpnstore.web.id"}\n` +
-                                       `Expired: ${durasi} Hari\n\n`;
-
-                        if (protokol === 'VMESS') pesanSukses += `Link TLS: \`${akun.vmess || akun.vmess_tls || akun.linkTls || "Cek Panel"}\`\n\n`;
-                        else if (protokol === 'VLESS') pesanSukses += `Link TLS: \`${akun.vless || akun.vless_tls || akun.linkTls || "Cek Panel"}\`\n\n`;
-                        else if (protokol === 'TROJAN') pesanSukses += `Link TLS: \`${akun.trojan || akun.trojan_tls || akun.linkTls || "Cek Panel"}\`\n\n`;
-                        
-                        pesanSukses += `Terima kasih telah berbelanja di MasD VPNStore!`;
-                        bot.telegram.sendMessage(chatId, pesanSukses, { parse_mode: 'Markdown' });
-                    }
-                }
-            } catch (err) {
-                bot.telegram.sendMessage(chatId, "⚠️ Terjadi kesalahan koneksi ke VPS.");
-            }
+        // 4. Kirim Gambar ke Telegram
+        ctx.replyWithPhoto({ url: linkGambarQr }, {
+            caption: `Total Pembayaran: Rp ${harga}\nOrder ID: ${orderId}\n\nSilakan scan QRIS di atas.\nSistem otomatis mengirim akun VPN Anda ke chat ini setelah pembayaran lunas.`
+        });
+        
+    } catch (err) {
+        // Tampilkan error aslinya di chat biar kita tahu letak masalahnya
+        ctx.reply(`⚠️ Terjadi Error Sistem: ${err.message}`);
+    }
         }
     }
     res.status(200).send('OK');
