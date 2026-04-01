@@ -8,6 +8,9 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
+// Memori sementara untuk menyimpan pilihan user sebelum mereka mengetik username
+const userState = {};
+
 function buatUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
         const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
@@ -15,66 +18,175 @@ function buatUUID() {
     });
 }
 
+// ==========================================
+// 1. MENU UTAMA
+// ==========================================
+function menuUtama() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('🛒 Beli VPN', 'MENU_ORDER'), Markup.button.callback('👤 Akun Saya', 'MENU_PROFIL')]
+    ]);
+}
+
 bot.start((ctx) => {
-    ctx.reply('Selamat datang di MasD VPNStore!\nSilakan pilih layanan Premium (30 Hari - Rp 10.000):', 
-        Markup.inlineKeyboard([
-            [Markup.button.callback('🇸🇬 Vmess SGDO', 'ORDER_VMESS_SGDO'), Markup.button.callback('🇮🇩 Vmess IDTECH', 'ORDER_VMESS_IDTECH')],
-            [Markup.button.callback('🇸🇬 Vless SGDO', 'ORDER_VLESS_SGDO'), Markup.button.callback('🇮🇩 Vless IDTECH', 'ORDER_VLESS_IDTECH')],
-            [Markup.button.callback('🇸🇬 Trojan SGDO', 'ORDER_TROJAN_SGDO'), Markup.button.callback('🇮🇩 Trojan IDTECH', 'ORDER_TROJAN_IDTECH')],
-            [Markup.button.callback('🇸🇬 SSH SGDO', 'ORDER_SSH_SGDO'), Markup.button.callback('🇮🇩 SSH IDTECH', 'ORDER_SSH_IDTECH')]
-        ])
-    );
+    delete userState[ctx.chat.id]; // Reset memori jika user ketik /start
+    ctx.reply('⚡ Selamat datang di MasD VPNStore Premium.\n\n👇 Silakan pilih menu di bawah ini:', menuUtama());
 });
 
-bot.action(/ORDER_([A-Z]+)_([A-Z]+)/, async (ctx) => {
-    const protokol = ctx.match[1];
-    const serverDipilih = ctx.match[2];
+bot.action('KEMBALI_AWAL', (ctx) => {
+    delete userState[ctx.chat.id];
+    ctx.editMessageText('⚡ Selamat datang di MasD VPNStore Premium.\n\n👇 Silakan pilih menu di bawah ini:', menuUtama());
+});
+
+// ==========================================
+// 2. ALUR ORDER STEP-BY-STEP
+// ==========================================
+bot.action('MENU_ORDER', (ctx) => {
+    ctx.editMessageText('Pilih Protokol:', Markup.inlineKeyboard([
+        [Markup.button.callback('SSH', 'PROTO_SSH'), Markup.button.callback('VLESS', 'PROTO_VLESS')],
+        [Markup.button.callback('VMess', 'PROTO_VMESS'), Markup.button.callback('Trojan', 'PROTO_TROJAN')],
+        [Markup.button.callback('🔙 Kembali', 'KEMBALI_AWAL')]
+    ]));
+});
+
+bot.action(/PROTO_([A-Z]+)/, (ctx) => {
+    const proto = ctx.match[1];
+    ctx.editMessageText(`Protokol: <b>${proto}</b>\n\nPilih Server:`, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('🇸🇬 Singapore DO', `SRV_${proto}_SGDO`)],
+            [Markup.button.callback('🇮🇩 Indonesia Techno', `SRV_${proto}_IDTECH`)],
+            [Markup.button.callback('🔙 Kembali', 'MENU_ORDER')]
+        ])
+    });
+});
+
+bot.action(/SRV_([A-Z]+)_([A-Z]+)/, (ctx) => {
+    const proto = ctx.match[1];
+    const srv = ctx.match[2];
+    ctx.editMessageText(`Protokol: <b>${proto}</b>\nServer: <b>${srv}</b>\n\nPilih Durasi:`, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('📅 15 Hari (Rp 5.000)', `PKG_${proto}_${srv}_15_5000`)],
+            [Markup.button.callback('🚀 30 Hari (Rp 10.000)', `PKG_${proto}_${srv}_30_10000`)],
+            [Markup.button.callback('🔙 Kembali', `PROTO_${proto}`)]
+        ])
+    });
+});
+
+// ==========================================
+// 3. TAHAP MINTA USERNAME
+// ==========================================
+bot.action(/PKG_([A-Z]+)_([A-Z]+)_(\d+)_(\d+)/, async (ctx) => {
+    const proto = ctx.match[1];
+    const srv = ctx.match[2];
+    const durasi = ctx.match[3];
+    const harga = ctx.match[4];
     const chatId = ctx.chat.id;
-    
-    const durasi = 30; 
-    const harga = 10000;
-    const usernameVpn = `masd${Math.floor(Math.random() * 1000)}`; 
-    
-    // FORMAT ORDER_ID: PROTOKOL-SERVER-DURASI-USERNAME-CHATID-TIMESTAMP
-    // ChatID diletakkan di posisi indeks ke-4 (menggantikan posisi 'password' di web) agar webhook bot bisa membalas chat
-    const orderId = `${protokol}-${serverDipilih}-${durasi}-${usernameVpn}-${chatId}-${Date.now()}`;
-    const namaLayanan = `${protokol}-${serverDipilih}`;
 
-    ctx.reply(`Mengecek sistem untuk ${namaLayanan}...\nMohon tunggu sebentar.`);
+    // Simpan pilihan ke memori bot
+    userState[chatId] = { step: 'WAITING_USERNAME', proto, srv, durasi, harga };
 
-    try {
-        await supabase.from('transaksi').insert([
-            { order_id: orderId, chat_id: chatId, layanan: namaLayanan, durasi: durasi, username_vpn: usernameVpn, status: 'pending' }
-        ]);
+    await ctx.deleteMessage(); // Hapus tombol biar rapi
+    await ctx.reply(`Anda memilih <b>${proto} ${srv} (${durasi} Hari)</b>.\n\n✍️ <b>Silakan ketik Username VPN yang Anda inginkan:</b>\n<i>(Ketik langsung balas di chat ini, tanpa spasi atau simbol)</i>`, { parse_mode: 'HTML' });
+});
 
-        // TRIK JENIUS: Nembak ke API Web Auto-Order milikmu sendiri!
-        const reqQris = await fetch('https://buy.masdpremium.biz.id/api/buat_qris', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ order_id: orderId, amount: harga })
-        });
+// ==========================================
+// 4. TANGKAP KETIKAN USERNAME & GENERATE QRIS
+// ==========================================
+bot.on('text', async (ctx) => {
+    const chatId = ctx.chat.id;
+    const text = ctx.message.text.trim();
+
+    // Cek apakah bot sedang menunggu username dari user ini
+    if (userState[chatId] && userState[chatId].step === 'WAITING_USERNAME') {
         
-        const resQris = await reqQris.json();
-
-        if (resQris.status === 'sukses' && resQris.qris_string) {
-            // Ubah string QRIS jadi gambar pakai API gratis
-            const linkGambarQr = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(resQris.qris_string)}`;
-
-            ctx.replyWithPhoto({ url: linkGambarQr }, {
-                caption: `Total Pembayaran: Rp ${parseInt(resQris.total_bayar || harga).toLocaleString('id-ID')}\nOrder ID: ${orderId}\n\nSilakan scan QRIS di atas.\nSistem otomatis mengirim akun VPN Anda ke chat ini setelah pembayaran lunas.`
-            });
-        } else {
-            ctx.reply(`⚠️ Gagal memuat QRIS dari web: ${resQris.alasan || JSON.stringify(resQris)}`);
+        // Validasi simpel: Username gak boleh ada spasi
+        if (text.includes(' ') || !/^[a-zA-Z0-9]+$/.test(text)) {
+            return ctx.reply('⚠️ Username hanya boleh berisi huruf dan angka tanpa spasi. Silakan ketik ulang:');
         }
-    } catch (err) {
-        ctx.reply(`⚠️ Terjadi Error API: ${err.message}`);
+
+        const { proto, srv, durasi, harga } = userState[chatId];
+        const usernameVpn = text.toLowerCase();
+        
+        delete userState[chatId]; // Hapus memori agar tidak double input
+
+        const orderId = `${proto}-${srv}-${durasi}-${usernameVpn}-${chatId}-${Date.now()}`;
+        const namaLayanan = `${proto}-${srv}`;
+
+        const msgLoading = await ctx.reply(`<i>⏳ Sedang memproses invoice untuk username <b>${usernameVpn}</b>...</i>`, { parse_mode: 'HTML' });
+
+        try {
+            await supabase.from('transaksi').insert([
+                { order_id: orderId, chat_id: chatId, layanan: namaLayanan, durasi: parseInt(durasi), username_vpn: usernameVpn, status: 'pending' }
+            ]);
+
+            const reqQris = await fetch('https://buy.masdpremium.biz.id/api/buat_qris', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ order_id: orderId, amount: parseInt(harga) })
+            });
+            const resQris = await reqQris.json();
+
+            if (resQris.status === 'sukses' && resQris.qris_string) {
+                // Bikin QRIS ukuran ideal yang rapi (350x350)
+                const linkGambarQr = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(resQris.qris_string)}&margin=10`;
+                
+                const invoiceText = `🧾 <b>INVOICE PEMBAYARAN</b> 🧾\n\n` +
+                                    `<b>Order ID:</b> <code>${orderId}</code>\n` +
+                                    `<b>Layanan:</b> ${proto} Premium\n` +
+                                    `<b>Server:</b> ${srv}\n` +
+                                    `<b>Durasi:</b> ${durasi} Hari\n` +
+                                    `<b>Username:</b> <code>${usernameVpn}</code>\n` +
+                                    `<b>Tagihan:</b> <b>Rp ${parseInt(resQris.total_bayar).toLocaleString('id-ID')}</b>\n\n` +
+                                    `<i>⚠️ Silakan scan QR Code di atas. Sistem otomatis mengirim akun VPN Anda ke chat ini setelah pembayaran lunas.</i>`;
+
+                await ctx.deleteMessage(msgLoading.message_id); 
+                await ctx.replyWithPhoto({ url: linkGambarQr }, {
+                    caption: invoiceText,
+                    parse_mode: 'HTML',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Cek Pembayaran', `CEK_${orderId}`), Markup.button.callback('❌ Batal', `BATAL_${orderId}`)]
+                    ])
+                });
+            } else {
+                await ctx.deleteMessage(msgLoading.message_id); 
+                ctx.reply(`⚠️ Gagal memuat QRIS: ${resQris.alasan}`, Markup.inlineKeyboard([[Markup.button.callback('🔙 Menu Utama', 'KEMBALI_AWAL')]]));
+            }
+        } catch(err) {
+            await ctx.deleteMessage(msgLoading.message_id); 
+            ctx.reply(`⚠️ Terjadi Error API: ${err.message}`, Markup.inlineKeyboard([[Markup.button.callback('🔙 Menu Utama', 'KEMBALI_AWAL')]]));
+        }
     }
 });
 
-// Endpoint untuk dipanggil Telegram
+// ==========================================
+// 5. TOMBOL CEK & BATAL
+// ==========================================
+bot.action(/CEK_(.*)/, async (ctx) => {
+    const orderId = ctx.match[1];
+    const { data } = await supabase.from('transaksi').select('status').eq('order_id', orderId).single();
+    
+    if(data && data.status === 'sukses') {
+        ctx.answerCbQuery('✅ Pembayaran LUNAS! Akun sedang dibuat...', { show_alert: true });
+    } else {
+        ctx.answerCbQuery('⏳ Pembayaran belum terdeteksi. Silakan coba beberapa saat lagi.', { show_alert: true });
+    }
+});
+
+bot.action(/BATAL_(.*)/, async (ctx) => {
+    const orderId = ctx.match[1];
+    await supabase.from('transaksi').update({ status: 'batal' }).eq('order_id', orderId);
+    ctx.deleteMessage();
+    ctx.reply('❌ Pesanan berhasil dibatalkan.', Markup.inlineKeyboard([[Markup.button.callback('🔙 Kembali ke Menu Utama', 'KEMBALI_AWAL')]]));
+});
+
+bot.action('MENU_PROFIL', (ctx) => { ctx.answerCbQuery('Fitur Akun Saya sedang dalam pengembangan 🛠️', { show_alert: true }); });
+
+// ==========================================
+// 6. WEBHOOK & EKSEKUSI VPS (LOGIC ASLI MASD)
+// ==========================================
 app.use(bot.webhookCallback('/api/telegram'));
 
-// Endpoint Webhook untuk menerima lunas dari Pakasir
 app.post('/api/pakasir', async (req, res) => {
     const dataPakasir = req.body;
     
@@ -85,31 +197,29 @@ app.post('/api/pakasir', async (req, res) => {
         const serverDipilih = potong[1];
         const durasi = parseInt(potong[2]);
         const username = potong[3];
-        const chatId = potong[4]; // Diambil dari posisi ke-4 di order_id
+        const chatId = potong[4]; 
         
         const { data: trxData } = await supabase.from('transaksi').select('*').eq('order_id', orderId).single();
 
         if (trxData && trxData.status === 'pending') {
             try {
-                bot.telegram.sendMessage(chatId, "✅ Pembayaran LUNAS! Sedang mengeksekusi VPS...");
+                bot.telegram.sendMessage(chatId, "✅ <b>Pembayaran LUNAS!</b> Sedang mengeksekusi server...", {parse_mode: 'HTML'});
 
                 let vpsUrl = '';
                 let fetchOptions = {};
-                let passwordSsh = chatId; // Pakai Chat ID sebagai password akun SSH biar aman & unik
+                let passwordSsh = chatId; // Pakai Chat ID sebagai password akun SSH
 
-                // LOGIKA ADOPSI DARI webhook.js MASD
                 if (serverDipilih === 'SGDO') {
-                    let endpoint = protokol.toLowerCase() + 'all'; 
+                    let endpoint = protokol.toLowerCase() + 'all';
                     if (protokol === 'SSH') endpoint = 'sshvpn';
 
                     vpsUrl = `http://167.172.73.230/vps/${endpoint}`;
                     let bodyData = { expired: durasi, limitip: 2, username: username };
-                    
                     if (protokol !== 'SSH') { 
-                        bodyData.kuota = 300; 
+                        bodyData.kuota = 300;
                         bodyData.uuidv2 = buatUUID(); 
                     } else { 
-                        bodyData.password = passwordSsh.toString(); 
+                        bodyData.password = passwordSsh.toString();
                     }
 
                     fetchOptions = {
@@ -125,7 +235,7 @@ app.post('/api/pakasir', async (req, res) => {
                     let bodyData = { server: "MASDVPN", username: username, ipLimit: 2, days: durasi };
                     if (protokol !== 'SSH') bodyData.quota = 300;
                     else bodyData.password = passwordSsh.toString();
-
+                    
                     fetchOptions = {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.AGUNG_API_KEY },
@@ -142,18 +252,20 @@ app.post('/api/pakasir', async (req, res) => {
                         const akun = hasilVPS.data || hasilVPS.akun || hasilVPS;
                         await supabase.from('transaksi').update({ status: 'sukses' }).eq('order_id', orderId);
 
-                        let pesanSukses = `🎉 **AKUN ${protokol} BERHASIL DIBUAT** 🎉\n\n` +
-                                          `Username: ${akun.username || akun.user || username}\n`;
-                        if (protokol === 'SSH') pesanSukses += `Password: ${akun.password || akun.pass || passwordSsh}\n`;
-                        pesanSukses += `Host: ${akun.hostname || akun.domain || akun.host || "id.masdvpnstore.web.id"}\n` +
-                                       `Expired: ${durasi} Hari\n\n`;
-
-                        if (protokol === 'VMESS') pesanSukses += `Link TLS: \`${akun.vmess || akun.vmess_tls || akun.linkTls || "Cek Panel"}\`\n\n`;
-                        else if (protokol === 'VLESS') pesanSukses += `Link TLS: \`${akun.vless || akun.vless_tls || akun.linkTls || "Cek Panel"}\`\n\n`;
-                        else if (protokol === 'TROJAN') pesanSukses += `Link TLS: \`${akun.trojan || akun.trojan_tls || akun.linkTls || "Cek Panel"}\`\n\n`;
+                        // FORMAT HASIL AKUN YANG ELEGAN
+                        let pesanSukses = `🎉 <b>AKUN ${protokol} BERHASIL DIBUAT!</b> 🎉\n\n` +
+                                          `<b>Username:</b> <code>${akun.username || akun.user || username}</code>\n`;
+                        if (protokol === 'SSH') pesanSukses += `<b>Password:</b> <code>${akun.password || akun.pass || passwordSsh}</code>\n`;
+                        pesanSukses += `<b>Host/IP:</b> <code>${akun.hostname || akun.domain || akun.host || "id.masdvpnstore.web.id"}</code>\n` +
+                                       `<b>Expired:</b> ${durasi} Hari\n\n`;
+                                       
+                        if (protokol === 'VMESS') pesanSukses += `<b>Link TLS:</b>\n<code>${akun.vmess || akun.vmess_tls || akun.linkTls || "Cek Panel"}</code>\n\n`;
+                        else if (protokol === 'VLESS') pesanSukses += `<b>Link TLS:</b>\n<code>${akun.vless || akun.vless_tls || akun.linkTls || "Cek Panel"}</code>\n\n`;
+                        else if (protokol === 'TROJAN') pesanSukses += `<b>Link TLS:</b>\n<code>${akun.trojan || akun.trojan_tls || akun.linkTls || "Cek Panel"}</code>\n\n`;
                         
-                        pesanSukses += `Terima kasih telah berbelanja di MasD VPNStore!`;
-                        bot.telegram.sendMessage(chatId, pesanSukses, { parse_mode: 'Markdown' });
+                        pesanSukses += `<i>Terima kasih telah berbelanja di MasD VPNStore!</i>`;
+                        
+                        bot.telegram.sendMessage(chatId, pesanSukses, { parse_mode: 'HTML' });
                     } else {
                         bot.telegram.sendMessage(chatId, `⚠️ VPS Menolak: ${JSON.stringify(hasilVPS)}`);
                     }
@@ -164,6 +276,17 @@ app.post('/api/pakasir', async (req, res) => {
         }
     }
     res.status(200).send('OK');
+});
+
+// ROUTE BANTUAN UNTUK SETTING WEBHOOK VERCEL
+app.get('/api/setup', async (req, res) => {
+    try {
+        const domain = `https://${req.headers.host}`;
+        await bot.telegram.setWebhook(`${domain}/api/telegram`);
+        res.send(`Webhook berhasil disetting ke: ${domain}/api/telegram`);
+    } catch (e) {
+        res.send(`Gagal set webhook: ${e.message}`);
+    }
 });
 
 module.exports = app;
